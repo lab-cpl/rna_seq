@@ -1,0 +1,764 @@
+---
+title: "rna_seq_rf"
+author: "luis_uarte"
+date: "2023-09-27"
+output: html_document
+---
+
+# load libs
+## TODO: specificy particular version of each lib
+```{r}
+pacman::p_load(
+    tidyverse,
+    tidymodels,
+    ggplot2,
+    bannerCommenter,
+    edgeR,
+    doFuture,
+    finetune,
+    tictoc,
+    see,
+    ggpubr,
+    beepr,
+    themis,
+    annotables,
+    furrr
+)
+```
+
+# sets path as script directory
+```{r}
+# https://stackoverflow.com/questions/47044068/get-the-path-of-current-script
+# get path of source file
+getCurrentFileLocation <-  function()
+{
+    this_file <- commandArgs() %>% 
+        tibble::enframe(name = NULL) %>%
+        tidyr::separate(col=value, into=c("key", "value"), sep="=", fill='right') %>%
+        dplyr::filter(key == "--file") %>%
+        dplyr::pull(value)
+    if (length(this_file)==0)
+    {
+        this_file <- rstudioapi::getSourceEditorContext()$path
+    }
+    return(dirname(this_file))
+}
+
+# sets path on source file location
+script_path <- getCurrentFileLocation()
+setwd(script_path)
+```
+
+# load data set (raw counts)
+```{r}
+# prepare data
+# raw counts per gene
+# ID 6 is left out
+# both directions are summed
+import <- list.files("./data/", pattern = "*.tab", full.names = TRUE) %>% 
+    map_dfr(., function(x){
+        read_delim(x, col_names = c(
+            "ensembl_gene_id",
+            "val",
+            "val1",
+            "val2"
+        ), delim = "\t") %>% 
+            mutate(
+                ID = str_extract(x, "[0-9]"),
+                ensembl_gene_id = str_extract(ensembl_gene_id, "ENSMUSG[0-9]*")
+                ) %>% 
+            tail(-4) %>% 
+            select(-c("val1", "val2")) %>% 
+            group_by(ensembl_gene_id, ID) %>% 
+            summarise(
+                val_sum = sum(val)
+            )
+    }) %>% filter(ID != 6) # sample with issues, pls take note of this!
+```
+
+# first data pre-proc step
+## remove genes with 0 counts (across all samples)
+```{r}
+raw_data <- import %>% 
+    group_by(ensembl_gene_id) %>% 
+    mutate(s = sum(val_sum) == 0) %>% 
+    filter(s == FALSE) %>% 
+    select(-s) %>% 
+    ungroup() %>% 
+    pivot_wider(
+        names_from = ID,
+        values_from = val_sum
+    )
+```
+
+# second data pre-proc step
+## data normalization as counts per million
+## more frequently called library normalization
+## library = n(gene reads)
+```{r}
+# normalize data by library length
+# this is the most typical normalization
+# sum all gene variants, so we get count per gene ignoring isoforms
+raw_data_sum <- raw_data %>%
+    group_by(
+        ensembl_gene_id
+    ) %>%
+    summarise(
+        across(where(is.numeric), list(sum))
+    )
+# write back col names
+colnames(raw_data_sum) <- colnames(raw_data)
+```
+
+# counts per million part 2, set as matrix
+```{r}
+# set data as matrix
+raw_data_sum_mat <- raw_data_sum %>%
+    select(-ensembl_gene_id) %>%
+    as.matrix()
+# set data into DGE matrix format
+rownames(raw_data_sum_mat) <- raw_data_sum$ensembl_gene_id
+
+# just to check number of 0 counts
+raw_data_sum %>% 
+    filter(across(is.numeric, ~ .x < 0))
+```
+
+# counts per million part 3, create DGE object and normalize data to
+# log2 counts per million
+```{r}
+# create DGE object
+raw_data_sum_dge <- DGEList(raw_data_sum)
+norm_data_dge <- calcNormFactors(raw_data_sum_dge)
+# TMM + log2 transform DGE object
+cpm_log2_data <- cpm(
+    norm_data_dge,
+    log = TRUE
+    ) %>%
+    as_tibble() %>%
+    mutate(
+        ensembl_gene_id = raw_data_sum$ensembl_gene_id,
+        .before = `1`
+    )
+```
+# third data pre-proc
+## get samples metadata
+```{r}
+# sample info
+# this specifies treatment for each ID
+sample_info <- read_csv("info_sample.csv") %>%
+    rename(
+        ID = SampleName
+    ) %>%
+    mutate(
+        ID = as.character(ID)
+    )
+
+# full model data with sample metadata
+full_model_data <- cpm_log2_data %>%
+    pivot_longer(
+        cols = where(is.numeric),
+        names_to = "ID"
+    ) %>%
+    left_join(
+        ., sample_info, by = c('ID')
+    ) %>%
+    pivot_wider(
+        names_from = ensembl_gene_id,
+        values_from = value
+    ) %>% 
+    mutate(
+        ID = as.factor(ID),
+        group = as.factor(group),
+    )
+```
+
+# fourth data pre-proc
+## remove gene with "low" expression
+```{r}
+# plot cpm distribution across all genes
+# Chen Y, Lun AT, Smyth GK. From reads to genes to pathways: differential expression analysis of RNA-Seq experiments using Rsubread and the edgeR quasi-likelihood pipeline. F1000Res. 2016 Jun 20;5:1438. doi: 10.12688/f1000research.8987.2. PMID: 27508061; PMCID: PMC4934518.
+
+# get cpm gene distribution
+cpm_dist <-
+    full_model_data %>% 
+    pivot_longer(
+        cols = starts_with("ENS")
+    ) %>% 
+    inner_join(grcm38, by = c("name"="ensgene")) %>% 
+    filter(
+        !is.na(entrez),
+        !grepl("predicted", description),
+           grepl("protein", biotype)
+        )
+# rule of thumb cpm is above 0.5 or 10 / L
+# where L is the minimum library size
+lib_sizes <- 
+    raw_data_sum_dge$samples$lib.size %>% 
+    {10 / (min(.)/1000000)}
+lib_sizes
+
+cpm_dist_plot <-
+    cpm_dist %>% 
+    ggplot(aes(
+        value, group = ID, color = ID
+    )) +
+    geom_density() +
+    geom_vline(xintercept = 0.5) +
+    theme(legend.position = "none")
+cpm_dist_plot
+
+# this is the actual filter
+# select only protein coding genes
+# cpm > 0.5
+# genes in entrez data base
+# after previous filters, genes that are present in more than 3 animals
+full_model_data_bak <- full_model_data # just for comparing gene number
+highly_expressed_genes <- full_model_data %>% 
+    pivot_longer(
+        cols = starts_with("ENS")
+    ) %>% 
+    inner_join(grcm38, by = c("name" = "ensgene")) %>% 
+    filter(!is.na(entrez), !grepl("predicted", description),
+           grepl("protein", biotype)) %>% 
+    filter(value > 0.5) %>% 
+    group_by(name) %>% 
+    summarise(n = n()) %>% 
+    filter(n > 3) %>%
+    pull(name)
+
+# DO filter
+full_model_data <- full_model_data %>% 
+    select(
+        ID, group, all_of(highly_expressed_genes)
+    )
+
+# compare pre and post filter
+pre <- dim(full_model_data_bak)[2] - 2
+post <- dim(full_model_data)[2] - 2
+tibble(
+    pre = pre,
+    post = post
+)
+```
+
+# fifth and last step
+## rank data by standard deviation
+```{r}
+# variance ranked data
+# set genes in a descending order y standard deviation
+# the idea is to think of gene in two axis: deviation and expression
+gene_rank <- full_model_data %>% 
+    pivot_longer(
+        cols = contains("ENSMUSG"),
+        names_to = "gene_name",
+        values_to = "cpm"
+    ) %>% 
+    group_by(gene_name) %>% 
+    summarise(
+        sd_val = sd(cpm)
+    ) %>% 
+    ungroup()
+
+ord_var_rank_data <- 
+    gene_rank %>% 
+    arrange(desc(sd_val)) %>% 
+    pull(gene_name)
+
+# cumulative std plot
+gene_rank %>% 
+    arrange(desc(sd_val)) %>% 
+    mutate(
+        r = row_number(),
+        cum_std = cumsum(sd_val)
+    ) %>% 
+    ggplot(aes(
+        r, cum_std
+    )) +
+    geom_line()
+```
+
+# fifth step part 2
+## create data partitions
+## here the 10% most variable is selected selection of this partition
+## is (1) following the logic of denoising data and 
+## (2) this was tested from 10 to 100% with cross-validation
+## cv procedure was exactly as the one thats below
+## data was not saved for each iteration as it was too large
+```{r}
+# get the first 100 partitions, from a 1000 division, 10% most variable
+partitions <- floor(seq(1, length(ord_var_rank_data), length.out = 1000)) %>% 
+    head(n=100)
+
+# generate a list with partitions
+full_model_data_parts <- partitions %>% 
+    map(., function(part){
+        sel_vec <- c("ID", "group", ord_var_rank_data[1:part])
+        out <- full_model_data %>% 
+            select(all_of(sel_vec))
+        return(out)
+    })
+
+```
+
+# model definition
+# here we define our random forest model and the way to cross-validate
+# performance and optimization
+```{r}
+# define model
+# this models tunes:
+# mtry: number of randomly samples genes at each split
+# min_n: minimun number of data points required for a node to split further
+# trees: number of classifiers
+rand_forest_model <- rand_forest(
+    mtry  = tune(),
+    min_n = tune(),
+    trees = tune()
+    ) %>%
+    set_engine("randomForest", importance = TRUE) %>%
+    set_mode("classification")
+
+# cross validation parameters
+# 6 folds + 10 repeats is equal to leave on out
+full_model_data_fold <- full_model_data_parts %>% 
+    map(., function(x){
+        vfold_cv(
+            x,
+            repeats = 10,
+            v = 6
+        )
+    })
+
+# recipes
+# set variables as outcome, predictor or id sample
+# check for nearly zero variance in predictor (this is to be 100% sure)
+# data was previous filter to include genes with large variance
+full_model_data_recipe <- full_model_data_parts %>% 
+    map(., function(x){
+        recipe(
+            x
+        ) %>% 
+            update_role(group, new_role = "outcome") %>%
+            update_role(-group, new_role = "predictor") %>% 
+            update_role(ID, new_role = "id sample") #%>% 
+#            step_nzv(all_numeric_predictors())
+    })
+
+
+# set multi-core
+plan(multisession, workers = 8)
+
+# define workflow
+# workflow is setting the prediction engine with cross validation
+full_model_data_workflow <- full_model_data_recipe %>% 
+    map(., function(x){
+        workflow() %>% 
+            add_model(rand_forest_model) %>% 
+            add_recipe(x)
+    })
+```
+
+# parameter optimization
+## for each hyperparameter a grid is build 
+## using cross validation best params are found
+## the grid range for each parameter consideres experimental logic
+## number of samples, number of classes, etc and iterative process to reduce
+## number of parameters to check, the grid is tested and reduced
+## computation issues are basically because number of samples is too low
+## so within each fold there is no enough samples to represent each class
+## this can be ignored as this cv is basically a leave one out, not ideal
+## but is the best for low number of samples
+```{r}
+# optimization of parameters is done through grid-search
+# objective function ~ cross validation
+# hard-coded are the results of optimization
+# https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-016-1228-x#MOESM17
+tree_grid <- full_model_data_recipe %>% 
+    map(., function(x){
+        # optimize hyper-parameters
+        # create grid
+        # get total number of predictor genes
+        n_genes <- summary(x)$variable %>% 
+            str_subset("ENSMUSG") %>% 
+            { print(length(.)) }
+        sqrt_n_genes <- round(sqrt(n_genes))
+        tree_grid <- expand.grid(
+            mtry = c(2, 10, 20),#527
+            min_n = c(2, 4, 6), #15
+            trees = c(5, 50, 100) #66
+        ) %>% 
+            unique
+    })
+
+# these are the results of the tune process
+# results are saved because they take a lot time to process
+# note here we check from 1 to 5, for full range use 1:100
+tuned_models <- 1:5 %>%
+    future_map(
+        .options = furrr_options(seed = TRUE),
+        ., function(x){
+        tictoc::tic()
+        full_model_data_optim <- full_model_data_workflow[[x]] %>%
+            tune_grid(
+                full_model_data_fold[[x]],
+                grid = tree_grid[[x]],
+                metrics = metric_set(accuracy, roc_auc, kap)
+                )
+        tictoc::toc()
+        fn <- paste("tuned_model_uncertainty", x, sep = "_")
+        saveRDS(full_model_data_optim, file = fn)
+        return(full_model_data_optim)
+    })
+```
+
+# visual inspection of results
+# roc_auc does not make much sense for loocv and low sample size
+# acc is metric used for optimization
+```{r}
+# load tuned models into a tibble
+tuned_model_list <- list.files(pattern = "tuned_model_uncertainty_[0-9]+") %>% 
+    str_sort(., numeric = TRUE) %>% 
+    map_dfr(., function(x){
+        data_perc <- str_extract(x, pattern = "[0-9]+")
+        tuned_model <- readRDS(x) %>% 
+            unnest(.metrics) %>% 
+            mutate(data_perc = as.numeric(data_perc))
+        return(tuned_model)
+    })
+
+# data for modeling contributions of hyperparameters
+params_results <-
+    tuned_model_list %>% 
+        group_by(data_perc, .metric, mtry, trees, min_n) %>% 
+        drop_na() %>% 
+        summarise(
+            mean_estimate = mean(.estimate) * 100,
+        ) %>% 
+        pivot_wider(
+            names_from = .metric,
+            values_from = mean_estimate
+        ) %>% 
+        arrange(desc(accuracy))
+params_results
+
+# after optimization this were the optimal parameters
+# this can change slighlty every time the code is run
+# but should be always near the top
+# this also determines optimal data percent, that is, the optimal partition
+# in this case is either 3 or 4 (30% or 40%)
+rf_params <- tibble(
+    mtry = 20,
+    trees = 100,
+    min_n = 6,
+    .config = "Preprocessor1_Model1"
+)
+```
+
+# re-fit model
+## after model is optimized we fit again to the complete data set
+## warning here are the same as in the optimization procedure
+## do note that accuracy here is widely stochastic, thats why to optimize
+## we repeat the procedure multiple times
+## accuracy printed here is just to show that
+```{r}
+# partition 3 (30% sd) was the optimal partition
+# re-fit model with optimal parameters
+full_model_data_optim <- full_model_data_workflow[[3]] %>%
+    tune_grid(
+        full_model_data_fold[[3]],
+        grid = data.frame(
+            mtry = 20,
+            trees = 10,
+            min_n = 5
+            ),
+        metrics = metric_set(accuracy, roc_auc, kap)
+        )
+
+# show accuracy of re-fit model 
+# rf are highly stochastic so this could change considerably every time
+# acc is ~0.7
+full_model_data_optim %>% 
+    show_best(metric = "accuracy")
+```
+
+# model finalization
+## here we obtained more robust fit estimates
+## and double-check that we choose optimal data partition
+```{r}
+# here the model is finalized
+# using optimal param and optimal partition
+# obtain a more robust estimate of performance
+# change vector from 1:10 to compute all relevant partitions
+fitted_models <- 1:3 %>%
+    map(., function(x){
+        tic()
+        folds <- vfold_cv(full_model_data_parts[[x]], v = 6, repeats = 10)
+        fitted_model <- finalize_workflow(
+            full_model_data_workflow[[x]],
+            rf_params
+        ) %>%
+            # this is the key function to obtain robust estimates
+            fit_resamples(folds, metrics = metric_set(accuracy, roc_auc, kap),
+                       control = control_resamples(save_pred = TRUE))
+        toc()
+        print(paste("Model", x, "DONE!", sep = " "))
+        return(fitted_model)
+    })
+
+# accuracy over partitions
+1:3 %>% 
+    map_dfr(
+        ., function(x){
+            collect_metrics(fitted_models[[x]]) %>% 
+                mutate(n = x)
+        }
+    ) %>% 
+    filter(.metric == "accuracy") %>% 
+    ggplot(aes(
+        n, mean
+    )) +
+    geom_point() +
+    geom_line() +
+    scale_x_continuous(breaks = 1:10) +
+    xlab("data partition number") +
+    ylab("mean accuracy")
+```
+
+# get variable importance
+## optimal model was re-fitted, now we are more sure of model goodness of fit
+## we determined that accuracy is OK, so we try to determine which
+## contributed the most to the tree partition process using the mean decrease in gini
+## gini measures partition purity, so to obtain this estimates we remove genes
+## and check the decrease in purity, large decreases indicates greater importance
+## as showed previous rf estimates are widely stochastic so to obtain robust estimates
+## we repeat computations at least 1000 time, in the code every time large computations
+## are performed a comment indicates that you should increase number of iteration for
+## proper results
+```{r}
+# compute variable importance
+# for optimal partition with optimal parameters
+# due to stochastic rf process this should be computed multiple times
+# note that we are using the optimal data partition
+variable_importance <- finalize_workflow(
+    full_model_data_workflow[[3]],
+    rf_params
+) %>% 
+    fit(full_model_data_parts[[3]]) %>% 
+    extract_fit_engine()
+variable_importance
+
+# for full estimate run at least 1000!
+# here only 10 times, so code runs faster
+var_imp_est <-
+    1:10 %>% 
+    future_map_dfr(
+        .options = furrr_options(seed = TRUE),
+        ., function(x){
+            var_imp_obj <-
+                finalize_workflow(
+                    full_model_data_workflow[[3]],
+                    rf_params
+                ) %>% 
+                fit(full_model_data_parts[[3]]) %>% 
+                extract_fit_engine()
+            s <-
+                var_imp_obj %>% 
+                # key function for estimated gini importance
+                randomForest::importance() %>% 
+                as.table() %>% 
+                as.data.frame() %>% 
+                as_tibble() %>% 
+                filter(Var2 == "MeanDecreaseGini") %>% 
+                arrange(desc(Freq)) %>% 
+                mutate(rank = row_number()) %>% 
+                rename(ensembl_gene_id = Var1) %>% 
+                inner_join(grcm38, by = c("ensembl_gene_id" = "ensgene")) %>% 
+                filter(
+                    !is.na(entrez),
+                    !grepl("predicted", description)
+                    ) %>% 
+                mutate(iteration = x)
+            return(s)
+        }
+    )
+var_imp_est
+
+# mean variable importance
+mean_var_imp <-
+    var_imp_est %>% 
+        group_by(description) %>% 
+        summarise(
+            mdg = mean(Freq),
+            mrank = mean(rank)
+        ) %>% 
+    arrange(desc(mdg))
+mean_var_imp
+
+# variable importance plot
+gini_decrease_plot <-
+    var_imp_est %>% 
+        ggplot(aes(
+            forcats::fct_reorder(factor(description,), Freq, mean, .desc = TRUE), Freq
+        )) +
+        stat_summary(fun.data = "mean_cl_boot", geom = "point") +
+        stat_summary(fun.data = "mean_cl_boot", geom = "errorbar") +
+        theme_pubr() +
+        theme(
+            axis.text.x = element_text(angle = 45, hjust = 1)
+        )
+gini_decrease_plot
+
+# Rank plot
+rank_plot <-
+    var_imp_est %>% 
+        ggplot(aes(
+            forcats::fct_reorder(factor(description,), rank, mean, .desc = FALSE), rank
+        )) +
+        stat_summary(fun.data = "mean_cl_boot", geom = "point") +
+        stat_summary(fun.data = "mean_cl_boot", geom = "errorbar") +
+        theme_pubr() +
+    scale_y_reverse() +
+        theme(
+            axis.text.x = element_text(angle = 45, hjust = 1)
+        )
+rank_plot
+
+# again, here use at least 100 iterations
+# this model finalizations are re-fitted to obtain
+# partial dependece plots
+var_imp_list <-
+    1:10 %>% 
+    future_map(
+        .options = furrr_options(seed = TRUE),
+        ., function(x){
+            
+            var_imp_obj <-
+                finalize_workflow(
+                    full_model_data_workflow[[3]],
+                    rf_params
+                ) %>% 
+                fit(full_model_data_parts[[3]]) %>% 
+                extract_fit_engine()
+        }
+    )
+var_imp_list
+
+pdp_plots_data <-
+    var_imp_list %>% 
+    future_map_dfr(
+        ., function(x){
+            # get gene names
+            gn <-
+                var_imp_est %>% 
+                filter(Freq > 0) %>% 
+                pull(ensembl_gene_id) %>% 
+                unique()
+            out <-
+                gn %>% 
+                map_dfr(., function(g){
+                    p <- pdp::partial(
+                    x,
+                    pred.var = c(g),
+                    grid.resolution = 100,
+                    which.class = "treatment",
+                    prob = TRUE,
+                    plot = FALSE, 
+                    train = as.data.frame(full_model_data_parts[[3]])
+                ) %>% 
+                    as_tibble() %>% 
+                    mutate(ensembl_gene_id = colnames(.)[1]) %>% 
+                    left_join(grcm38, by = c("ensembl_gene_id" = "ensgene"))
+                    colnames(p)[1] <- "x"
+                    return(p)
+                })
+            return(out)
+        }
+    )
+pdp_plots_data
+
+pdp_plots_data$symbol <- factor(
+    pdp_plots_data$symbol,
+    levels = c(
+            "Mup6", "Pmch", "Hcrt",
+            "Pvalb", "Cplx3", "Chrna2"
+    )
+)
+pdp_gam <-
+    pdp_plots_data %>% 
+    drop_na() %>% 
+    filter(
+        symbol %in% c(
+            "Mup6", "Pmch", "Hcrt",
+            "Pvalb", "Cplx3", "Chrna2"
+            )
+    ) %>% 
+        ggplot(aes(
+            x, yhat
+        )) +
+        geom_smooth(method = "gam") +
+        facet_wrap(~symbol, scales = "free") +
+    theme_pubr() +
+    theme(
+        text = element_text(size = 30)
+    ) +
+    xlab("CPM") +
+    ylab("P(class = Uncertainty)")
+pdp_gam
+    
+
+# get the slopes
+pdp_gini_slopes <-
+    pdp_plots_data %>% 
+    group_by(symbol) %>% 
+    group_split() %>% 
+    map_dfr(
+        ., function(gene){
+            mdl <- lm(yhat ~ x, data = gene)
+            out <- broom::tidy(mdl, conf.int = TRUE)
+            slope <- out %>%
+                pull(estimate) %>% 
+                {.[2]}
+            conf.low <- out %>% 
+                pull(conf.low) %>% 
+                {.[2]}
+            conf.high <- out %>% 
+                pull(conf.high) %>% 
+                {.[2]}
+            r <- tibble(
+                slope = slope,
+                conf.low = conf.low,
+                conf.high = conf.high,
+                gene = gene$symbol %>% unique()
+            )
+            return(r)
+        }
+    ) %>% 
+    mutate(gene = as.factor(gene), sign = sign(slope)) %>% 
+    arrange(desc(abs(slope)))
+pdp_gini_slopes
+
+# just to re order based on slopes
+pdp_gini_slopes$gene <- factor(pdp_gini_slopes$gene,
+                               levels = pdp_gini_slopes$gene[order(desc(pdp_gini_slopes$slope))])
+
+pdp_gini_slopes_plot <-
+    pdp_gini_slopes %>% 
+    drop_na() %>% 
+        ggplot(aes(
+            gene, slope, ymin = conf.low, ymax = conf.high, fill = as.factor(sign)
+        )) +
+        geom_hline(yintercept = 0, color = "gray", linewidth = 1) +
+        geom_col(shape = 15, size = 2) +
+        geom_errorbar(width = 0.5, linewidth = 1) +
+        theme_pubr() +
+        theme(
+                text = element_text(size = 30),
+                axis.text.x = element_text(angle = 45, hjust = 1),
+                legend.position = "none"
+        ) +
+        ylab("P(class = Uncertainty) slope") +
+        xlab("")
+pdp_gini_slopes_plot
+    
+```
+
